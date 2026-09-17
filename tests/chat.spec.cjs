@@ -37,10 +37,11 @@ test('chat history persists after reloading the page', async ({ page }) => {
 
   await chatPage.sendMessage('This message should still be here after reload');
 
-  // Reload and rejoin — the message should load from the server's history,
-  // not just be sitting in React state from before the reload.
+  // Reload — the session persists automatically (no login screen), and the
+  // message should load from the server's history, not just be sitting in
+  // React state from before the reload.
   await page.reload();
-  await chatPage.join('Ian');
+  await page.locator('.message-form input').waitFor({ state: 'visible', timeout: 10000 });
 
   await expect(chatPage.getMessage('This message should still be here after reload')).toBeVisible();
 });

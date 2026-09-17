@@ -4,13 +4,28 @@ const cors = require('cors');
 const { Server } = require('socket.io');
 const Database = require('better-sqlite3');
 const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// In a real deployment this comes from an environment variable / secret
+// manager and is never committed to source control. A fallback constant
+// keeps setup simple for this practice project.
+const JWT_SECRET = process.env.JWT_SECRET || 'realtime-chat-dev-secret-change-me';
+const TOKEN_EXPIRY = '7d';
+
 const db = new Database(path.join(__dirname, 'chat.db'));
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS rooms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -43,14 +58,74 @@ if (roomCount === 0) {
   insertRoom.run('Random');
 }
 
+function signToken(username) {
+  return jwt.sign({ username }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+}
+
+// Protects a REST route: requires a valid "Authorization: Bearer <token>"
+// header and attaches the verified username to the request.
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.username = payload.username;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired session' });
+  }
+}
+
+// ---- Auth ----
+
+app.post('/api/auth/signup', (req, res) => {
+  const username = (req.body.username || '').trim();
+  const password = req.body.password || '';
+
+  if (username.length < 3) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  }
+
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (existing) {
+    return res.status(409).json({ error: 'That username is already taken' });
+  }
+
+  const passwordHash = bcrypt.hashSync(password, 10);
+  db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run(username, passwordHash);
+
+  res.status(201).json({ token: signToken(username), username });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const username = (req.body.username || '').trim();
+  const password = req.body.password || '';
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  // Same generic error whether the username doesn't exist or the password
+  // is wrong — this avoids confirming to an attacker which usernames are
+  // actually registered.
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+
+  res.json({ token: signToken(username), username });
+});
+
 // ---- Rooms ----
 
-app.get('/api/rooms', (req, res) => {
+app.get('/api/rooms', requireAuth, (req, res) => {
   const rooms = db.prepare('SELECT * FROM rooms ORDER BY id ASC').all();
   res.json(rooms);
 });
 
-app.post('/api/rooms', (req, res) => {
+app.post('/api/rooms', requireAuth, (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) {
     return res.status(400).json({ error: 'Room name is required' });
@@ -72,7 +147,7 @@ app.post('/api/rooms', (req, res) => {
 
 // ---- Messages (scoped to a room) ----
 
-app.get('/api/messages', (req, res) => {
+app.get('/api/messages', requireAuth, (req, res) => {
   const roomId = Number(req.query.roomId);
   if (!roomId) {
     return res.status(400).json({ error: 'roomId query param is required' });
@@ -85,10 +160,14 @@ app.get('/api/messages', (req, res) => {
 
 // ---- Direct messages (private, between two users) ----
 
-app.get('/api/dms', (req, res) => {
+app.get('/api/dms', requireAuth, (req, res) => {
   const { user1, user2 } = req.query;
   if (!user1 || !user2) {
     return res.status(400).json({ error: 'user1 and user2 query params are required' });
+  }
+  // Only the two people in the conversation may read it back.
+  if (req.username !== user1 && req.username !== user2) {
+    return res.status(403).json({ error: "You can't view another pair's conversation" });
   }
   const messages = db
     .prepare(
@@ -100,10 +179,10 @@ app.get('/api/dms', (req, res) => {
   res.json(messages);
 });
 
-// Test-only helper: wipe all rooms/messages and reseed the two defaults, so
-// the Playwright suite can start every run from a known, clean state.
+// Test-only helper: wipe all data and reseed the two default rooms, so the
+// Playwright suite can start every run from a known, clean state.
 app.post('/api/test-reset', (req, res) => {
-  db.exec('DELETE FROM messages; DELETE FROM direct_messages; DELETE FROM rooms;');
+  db.exec('DELETE FROM messages; DELETE FROM direct_messages; DELETE FROM rooms; DELETE FROM users;');
   const insertRoom = db.prepare('INSERT INTO rooms (name) VALUES (?)');
   insertRoom.run('General');
   insertRoom.run('Random');
@@ -125,19 +204,30 @@ function roomChannel(roomId) {
 // be broadcast to everyone.
 const onlineUsers = new Map();
 
+// Every socket connection must present a valid JWT up front. This runs
+// before 'connection', so a socket's username is verified cryptographically
+// before any event handler ever sees it — nobody can claim to be someone
+// else just by sending a different name in an event payload (the way the
+// old display-name-only version worked).
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    return next(new Error('Authentication required'));
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    socket.username = payload.username;
+    next();
+  } catch (err) {
+    next(new Error('Invalid or expired session'));
+  }
+});
+
 io.on('connection', (socket) => {
   let currentRoomId = null;
 
-  // A client registers its display name right after joining the app. Other
-  // features (DMs, the online-users list) wait on this ack the same way
-  // room-joins wait on their own ack, so a message can never be routed
-  // before the server actually knows who this socket belongs to.
-  socket.on('register-user', ({ username }, callback) => {
-    socket.username = username;
-    onlineUsers.set(username, socket.id);
-    io.emit('users-online', Array.from(onlineUsers.keys()));
-    if (typeof callback === 'function') callback();
-  });
+  onlineUsers.set(socket.username, socket.id);
+  io.emit('users-online', Array.from(onlineUsers.keys()));
 
   socket.on('join-room', ({ roomId }, callback) => {
     if (currentRoomId) {
@@ -152,8 +242,12 @@ io.on('connection', (socket) => {
     if (typeof callback === 'function') callback();
   });
 
-  socket.on('send-message', ({ roomId, username, text }) => {
-    if (!roomId || !username || !text || !text.trim()) return;
+  socket.on('send-message', ({ roomId, text }) => {
+    // The sender's name comes from the authenticated socket, never from
+    // the event payload — so a message can never be posted under someone
+    // else's identity.
+    const username = socket.username;
+    if (!roomId || !text || !text.trim()) return;
 
     const stmt = db.prepare('INSERT INTO messages (room_id, username, text) VALUES (?, ?, ?)');
     const result = stmt.run(roomId, username, text.trim());
@@ -187,7 +281,7 @@ io.on('connection', (socket) => {
     if (currentRoomId) {
       socket.leave(roomChannel(currentRoomId));
     }
-    if (socket.username && onlineUsers.get(socket.username) === socket.id) {
+    if (onlineUsers.get(socket.username) === socket.id) {
       onlineUsers.delete(socket.username);
       io.emit('users-online', Array.from(onlineUsers.keys()));
     }

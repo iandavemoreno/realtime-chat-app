@@ -1,5 +1,10 @@
 const { expect } = require('@playwright/test');
 
+// A default used by every test that doesn't care about the password itself
+// (most of them) — the server's test-reset endpoint clears the users table
+// before each test, so re-signing-up with the same username never collides.
+const DEFAULT_TEST_PASSWORD = 'TestPass123!';
+
 class ChatPage {
   constructor(page) {
     this.page = page;
@@ -9,11 +14,49 @@ class ChatPage {
     await this.page.goto('/');
   }
 
-  async join(username) {
-    await this.page.locator('.join-screen input').fill(username);
-    await this.page.locator('.join-screen button').click();
-    // Confirms we've actually left the join screen and the chat is ready
+  // Signs up a brand-new account and logs straight into the chat. This is
+  // what nearly every existing test calls — it's named `join` for backward
+  // compatibility with the pre-auth version of the app.
+  async join(username, password = DEFAULT_TEST_PASSWORD) {
+    return this.signUp(username, password);
+  }
+
+  async signUp(username, password = DEFAULT_TEST_PASSWORD) {
+    await this.switchToSignUp();
+    await this.submitAuthForm(username, password);
+    // Confirms we've actually left the auth screen and the chat is ready
     await this.page.locator('.message-form input').waitFor({ state: 'visible' });
+  }
+
+  async logIn(username, password) {
+    await this.switchToLogIn();
+    await this.submitAuthForm(username, password);
+  }
+
+  // Fills and submits the auth form without asserting the outcome — use
+  // this directly (after switchToSignUp/switchToLogIn) for negative cases
+  // where you expect an error rather than a successful login.
+  async submitAuthForm(username, password) {
+    await this.page.locator('.auth-form input[name="username"]').fill(username);
+    await this.page.locator('.auth-form input[name="password"]').fill(password);
+    await this.page.locator('.auth-form button[type="submit"]').click();
+  }
+
+  switchToSignUp() {
+    return this.page.locator('.auth-tab', { hasText: 'Sign Up' }).click();
+  }
+
+  switchToLogIn() {
+    return this.page.locator('.auth-tab', { hasText: 'Log In' }).click();
+  }
+
+  getAuthError() {
+    return this.page.locator('.auth-error');
+  }
+
+  async logOut() {
+    await this.page.locator('.logout-button').click();
+    await this.page.locator('.auth-form').waitFor({ state: 'visible' });
   }
 
   getRoomItem(roomName) {

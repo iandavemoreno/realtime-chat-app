@@ -105,8 +105,10 @@ test('direct message history persists after reloading the page', async ({ browse
   await chatPageA.openDm('Bob');
   await chatPageA.sendMessage('This should still be here after reload');
 
+  // Reload — the session persists automatically (no login screen), landing
+  // back in the default room view; reopening the DM re-loads its history.
   await pageA.reload();
-  await chatPageA.join('Alice');
+  await pageA.locator('.message-form input').waitFor({ state: 'visible', timeout: 10000 });
   await chatPageA.openDm('Bob');
 
   await expect(chatPageA.getMessage('This should still be here after reload')).toBeVisible();

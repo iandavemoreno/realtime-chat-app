@@ -3,12 +3,20 @@ import { io } from 'socket.io-client';
 import './App.css';
 
 const SOCKET_URL = 'http://localhost:3004';
+const STORAGE_KEY = 'chatAuth';
 
 function App() {
+  // ---- Auth ----
+  const [authenticated, setAuthenticated] = useState(false);
   const [username, setUsername] = useState('');
-  const [joined, setJoined] = useState(false);
-  const [nameInput, setNameInput] = useState('');
-  const [registered, setRegistered] = useState(false);
+  const [token, setToken] = useState(null);
+  const [authMode, setAuthMode] = useState('signup'); // 'signup' | 'login'
+  const [authUsernameInput, setAuthUsernameInput] = useState('');
+  const [authPasswordInput, setAuthPasswordInput] = useState('');
+  const [authError, setAuthError] = useState(null);
+  const [authLoading, setAuthLoading] = useState(false);
+
+  const [socketConnected, setSocketConnected] = useState(false);
 
   const [rooms, setRooms] = useState([]);
   const [currentRoomId, setCurrentRoomId] = useState(null);
@@ -37,23 +45,122 @@ function App() {
     currentDmUserRef.current = currentDmUser;
   }, [currentDmUser]);
 
-  // Connect once after joining: register our username, load the room list,
-  // and listen for anything that isn't scoped to a single room/DM.
+  // Restore a previous session on load, so refreshing the page doesn't
+  // force the user to log in again.
   useEffect(() => {
-    if (!joined) return;
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.token && parsed?.username) {
+          setToken(parsed.token);
+          setUsername(parsed.username);
+          setAuthenticated(true);
+        }
+      }
+    } catch (err) {
+      // Corrupted or unreadable localStorage — just show the login screen.
+    }
+  }, []);
 
-    const socket = io(SOCKET_URL);
+  function authHeaders() {
+    return { Authorization: `Bearer ${token}` };
+  }
+
+  function handleAuthSuccess(data) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ token: data.token, username: data.username }));
+    setToken(data.token);
+    setUsername(data.username);
+    setAuthenticated(true);
+    setAuthError(null);
+    setAuthPasswordInput('');
+  }
+
+  async function handleAuthSubmit(e) {
+    e.preventDefault();
+    setAuthError(null);
+
+    const usernameValue = authUsernameInput.trim();
+    const passwordValue = authPasswordInput;
+
+    if (usernameValue.length < 3) {
+      setAuthError('Username must be at least 3 characters');
+      return;
+    }
+    if (passwordValue.length < 6) {
+      setAuthError('Password must be at least 6 characters');
+      return;
+    }
+
+    setAuthLoading(true);
+    try {
+      const endpoint = authMode === 'signup' ? '/api/auth/signup' : '/api/auth/login';
+      const res = await fetch(`${SOCKET_URL}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: usernameValue, password: passwordValue }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Something went wrong');
+        return;
+      }
+      handleAuthSuccess(data);
+    } catch (err) {
+      setAuthError('Could not reach the server. Is it running?');
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function handleLogout() {
+    socketRef.current?.disconnect();
+    localStorage.removeItem(STORAGE_KEY);
+    setAuthenticated(false);
+    setToken(null);
+    setUsername('');
+    setSocketConnected(false);
+    setRooms([]);
+    setCurrentRoomId(null);
+    setRoomReady(false);
+    setOnlineUsers([]);
+    setViewMode('room');
+    setCurrentDmUser(null);
+    setMessages([]);
+    setAuthMode('signup');
+    setAuthUsernameInput('');
+    setAuthPasswordInput('');
+  }
+
+  // Connect once we're authenticated: the JWT proves who we are, so there's
+  // no separate "register my name" step — the server already knows.
+  useEffect(() => {
+    if (!authenticated || !token) return;
+
+    const socket = io(SOCKET_URL, { auth: { token } });
     socketRef.current = socket;
 
-    socket.emit('register-user', { username }, () => {
-      // Only now is this socket guaranteed to be known to the server by
-      // name, so direct messages sent to/from it will actually route.
-      setRegistered(true);
+    socket.on('connect', () => setSocketConnected(true));
+    socket.on('disconnect', () => setSocketConnected(false));
+    socket.on('connect_error', () => {
+      // The token was rejected (expired, tampered, or the server restarted
+      // with a different secret) — the session is no longer valid.
+      localStorage.removeItem(STORAGE_KEY);
+      setAuthenticated(false);
+      setToken(null);
+      setUsername('');
+      setAuthError('Your session expired. Please log in again.');
     });
 
-    fetch(`${SOCKET_URL}/api/rooms`)
-      .then((res) => res.json())
-      .then(setRooms);
+    fetch(`${SOCKET_URL}/api/rooms`, { headers: authHeaders() })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('Failed to load rooms'))))
+      .then(setRooms)
+      .catch(() => {
+        // A rejected session shows up here too (not just via the socket) —
+        // 'connect_error' above is what actually drives the user back to
+        // the login screen, this just avoids crashing on a non-array
+        // response in the meantime.
+      });
 
     socket.on('room-created', (room) => {
       setRooms((prev) => [...prev, room]);
@@ -76,7 +183,7 @@ function App() {
     return () => {
       socket.disconnect();
     };
-  }, [joined]);
+  }, [authenticated, token]);
 
   // Once rooms load, default to the first one
   useEffect(() => {
@@ -99,9 +206,10 @@ function App() {
       setRoomReady(true);
     });
 
-    fetch(`${SOCKET_URL}/api/messages?roomId=${currentRoomId}`)
-      .then((res) => res.json())
-      .then(setMessages);
+    fetch(`${SOCKET_URL}/api/messages?roomId=${currentRoomId}`, { headers: authHeaders() })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('Failed to load messages'))))
+      .then(setMessages)
+      .catch(() => {});
 
     function handleNewMessage(message) {
       if (message.room_id === currentRoomId && viewModeRef.current === 'room') {
@@ -113,33 +221,28 @@ function App() {
     return () => {
       socket.off('new-message', handleNewMessage);
     };
-  }, [currentRoomId, viewMode]);
+  }, [currentRoomId, viewMode, token]);
 
   // Whenever a DM conversation is opened, load its history.
   useEffect(() => {
     if (viewMode !== 'dm' || !currentDmUser) return;
-    fetch(`${SOCKET_URL}/api/dms?user1=${encodeURIComponent(username)}&user2=${encodeURIComponent(currentDmUser)}`)
-      .then((res) => res.json())
-      .then((dms) => setMessages(dms.map((m) => ({ id: m.id, username: m.from_username, text: m.text }))));
-  }, [viewMode, currentDmUser]);
+    fetch(`${SOCKET_URL}/api/dms?user1=${encodeURIComponent(username)}&user2=${encodeURIComponent(currentDmUser)}`, {
+      headers: authHeaders(),
+    })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('Failed to load DM history'))))
+      .then((dms) => setMessages(dms.map((m) => ({ id: m.id, username: m.from_username, text: m.text }))))
+      .catch(() => {});
+  }, [viewMode, currentDmUser, token]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
-  function handleJoin(e) {
-    e.preventDefault();
-    if (!nameInput.trim()) return;
-    setUsername(nameInput.trim());
-    setJoined(true);
-  }
 
   function handleSend(e) {
     e.preventDefault();
     if (!messageInput.trim() || !currentRoomId) return;
     socketRef.current.emit('send-message', {
       roomId: currentRoomId,
-      username,
       text: messageInput,
     });
     setMessageInput('');
@@ -162,7 +265,7 @@ function App() {
 
     const res = await fetch(`${SOCKET_URL}/api/rooms`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ name }),
     });
 
@@ -187,19 +290,52 @@ function App() {
     setCurrentDmUser(otherUsername);
   }
 
-  if (!joined) {
+  if (!authenticated) {
     return (
       <div className="join-screen">
-        <form onSubmit={handleJoin}>
+        <form className="auth-form" onSubmit={handleAuthSubmit}>
           <h1>Realtime Chat</h1>
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={`auth-tab ${authMode === 'signup' ? 'active' : ''}`}
+              onClick={() => {
+                setAuthMode('signup');
+                setAuthError(null);
+              }}
+            >
+              Sign Up
+            </button>
+            <button
+              type="button"
+              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
+              onClick={() => {
+                setAuthMode('login');
+                setAuthError(null);
+              }}
+            >
+              Log In
+            </button>
+          </div>
           <input
             type="text"
-            placeholder="Enter your display name"
-            value={nameInput}
-            onChange={(e) => setNameInput(e.target.value)}
+            name="username"
+            placeholder="Username"
+            value={authUsernameInput}
+            onChange={(e) => setAuthUsernameInput(e.target.value)}
             autoFocus
           />
-          <button type="submit">Join Chat</button>
+          <input
+            type="password"
+            name="password"
+            placeholder="Password"
+            value={authPasswordInput}
+            onChange={(e) => setAuthPasswordInput(e.target.value)}
+          />
+          {authError && <p className="auth-error">{authError}</p>}
+          <button type="submit" disabled={authLoading}>
+            {authLoading ? 'Please wait…' : authMode === 'signup' ? 'Create Account' : 'Log In'}
+          </button>
         </form>
       </div>
     );
@@ -208,7 +344,7 @@ function App() {
   const currentRoom = rooms.find((r) => r.id === currentRoomId);
   const otherOnlineUsers = onlineUsers.filter((u) => u !== username);
   const headerTitle = viewMode === 'dm' ? currentDmUser : currentRoom ? currentRoom.name : 'Realtime Chat';
-  const isComposerReady = viewMode === 'dm' ? registered : registered && roomReady;
+  const isComposerReady = viewMode === 'dm' ? socketConnected : socketConnected && roomReady;
 
   return (
     <div className="chat-app">
@@ -258,7 +394,12 @@ function App() {
       <div className="chat-main">
         <header className="chat-header">
           <h1>{headerTitle}</h1>
-          <span className="current-user">Logged in as {username}</span>
+          <span className="current-user">
+            Logged in as {username}
+            <button className="logout-button" onClick={handleLogout}>
+              Log Out
+            </button>
+          </span>
         </header>
 
         <div className="messages-list">
