@@ -123,6 +123,59 @@
   white-space: nowrap;
 }
 
+.dm-section-title {
+  margin-top: 20px;
+}
+
+.dm-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dm-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #333;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dm-item::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.dm-item:hover {
+  background: #ececf5;
+}
+
+.dm-item.active {
+  background: #4f46e5;
+  color: white;
+}
+
+.no-users-message {
+  font-size: 13px;
+  color: #999;
+  padding: 4px 10px;
+  margin: 0;
+}
+
 .chat-main {
   flex: 1;
   display: flex;

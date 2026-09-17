@@ -47,6 +47,16 @@ class ChatPage {
   getMessage(text) {
     return this.page.locator('.message-text', { hasText: text });
   }
+
+  getDmItem(username) {
+    return this.page.locator('.dm-item', { hasText: username });
+  }
+
+  async openDm(username) {
+    await this.getDmItem(username).click();
+    // The header updates to the other person's name once the switch lands
+    await expect(this.page.locator('.chat-header h1')).toHaveText(username);
+  }
 }
 
 module.exports = ChatPage;

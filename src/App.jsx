@@ -8,24 +8,48 @@ function App() {
   const [username, setUsername] = useState('');
   const [joined, setJoined] = useState(false);
   const [nameInput, setNameInput] = useState('');
+  const [registered, setRegistered] = useState(false);
 
   const [rooms, setRooms] = useState([]);
   const [currentRoomId, setCurrentRoomId] = useState(null);
   const [newRoomName, setNewRoomName] = useState('');
+  const [roomReady, setRoomReady] = useState(false);
+
+  const [onlineUsers, setOnlineUsers] = useState([]);
+  const [viewMode, setViewMode] = useState('room'); // 'room' | 'dm'
+  const [currentDmUser, setCurrentDmUser] = useState(null);
 
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState('');
-  const [roomReady, setRoomReady] = useState(false);
 
   const socketRef = useRef(null);
   const messagesEndRef = useRef(null);
 
-  // Connect once after joining, and load the room list
+  // Kept in refs so the long-lived 'new-dm' listener (registered once) can
+  // always see the latest view without needing to be torn down and
+  // re-attached every time the user switches conversations.
+  const viewModeRef = useRef(viewMode);
+  const currentDmUserRef = useRef(currentDmUser);
+  useEffect(() => {
+    viewModeRef.current = viewMode;
+  }, [viewMode]);
+  useEffect(() => {
+    currentDmUserRef.current = currentDmUser;
+  }, [currentDmUser]);
+
+  // Connect once after joining: register our username, load the room list,
+  // and listen for anything that isn't scoped to a single room/DM.
   useEffect(() => {
     if (!joined) return;
 
     const socket = io(SOCKET_URL);
     socketRef.current = socket;
+
+    socket.emit('register-user', { username }, () => {
+      // Only now is this socket guaranteed to be known to the server by
+      // name, so direct messages sent to/from it will actually route.
+      setRegistered(true);
+    });
 
     fetch(`${SOCKET_URL}/api/rooms`)
       .then((res) => res.json())
@@ -33,6 +57,20 @@ function App() {
 
     socket.on('room-created', (room) => {
       setRooms((prev) => [...prev, room]);
+    });
+
+    socket.on('users-online', (usernames) => {
+      setOnlineUsers(usernames);
+    });
+
+    socket.on('new-dm', (msg) => {
+      const other = msg.from_username === username ? msg.to_username : msg.from_username;
+      // Only append if we're actually looking at this conversation right
+      // now — otherwise it's still saved server-side and will load next
+      // time this DM is opened.
+      if (viewModeRef.current === 'dm' && currentDmUserRef.current === other) {
+        setMessages((prev) => [...prev, { id: msg.id, username: msg.from_username, text: msg.text }]);
+      }
     });
 
     return () => {
@@ -47,9 +85,11 @@ function App() {
     }
   }, [rooms, currentRoomId]);
 
-  // Whenever the selected room changes: join its socket channel and load its history
+  // Whenever the selected room is (re)selected: join its socket channel and
+  // load its history. Re-runs on a view-mode change too, so switching back
+  // to "Rooms" after viewing a DM re-syncs the room view.
   useEffect(() => {
-    if (!currentRoomId || !socketRef.current) return;
+    if (viewMode !== 'room' || !currentRoomId || !socketRef.current) return;
     const socket = socketRef.current;
 
     setRoomReady(false);
@@ -64,7 +104,7 @@ function App() {
       .then(setMessages);
 
     function handleNewMessage(message) {
-      if (message.room_id === currentRoomId) {
+      if (message.room_id === currentRoomId && viewModeRef.current === 'room') {
         setMessages((prev) => [...prev, message]);
       }
     }
@@ -73,7 +113,15 @@ function App() {
     return () => {
       socket.off('new-message', handleNewMessage);
     };
-  }, [currentRoomId]);
+  }, [currentRoomId, viewMode]);
+
+  // Whenever a DM conversation is opened, load its history.
+  useEffect(() => {
+    if (viewMode !== 'dm' || !currentDmUser) return;
+    fetch(`${SOCKET_URL}/api/dms?user1=${encodeURIComponent(username)}&user2=${encodeURIComponent(currentDmUser)}`)
+      .then((res) => res.json())
+      .then((dms) => setMessages(dms.map((m) => ({ id: m.id, username: m.from_username, text: m.text }))));
+  }, [viewMode, currentDmUser]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -97,6 +145,16 @@ function App() {
     setMessageInput('');
   }
 
+  function handleSendDm(e) {
+    e.preventDefault();
+    if (!messageInput.trim() || !currentDmUser) return;
+    socketRef.current.emit('send-dm', {
+      toUsername: currentDmUser,
+      text: messageInput,
+    });
+    setMessageInput('');
+  }
+
   async function handleCreateRoom(e) {
     e.preventDefault();
     const name = newRoomName.trim();
@@ -114,8 +172,19 @@ function App() {
       // The room itself gets added to the sidebar via the "room-created"
       // socket broadcast (so every connected client sees it, not just us) —
       // here we just jump straight into the new room.
+      setViewMode('room');
       setCurrentRoomId(room.id);
     }
+  }
+
+  function handleSelectRoom(roomId) {
+    setViewMode('room');
+    setCurrentRoomId(roomId);
+  }
+
+  function handleOpenDm(otherUsername) {
+    setViewMode('dm');
+    setCurrentDmUser(otherUsername);
   }
 
   if (!joined) {
@@ -137,6 +206,9 @@ function App() {
   }
 
   const currentRoom = rooms.find((r) => r.id === currentRoomId);
+  const otherOnlineUsers = onlineUsers.filter((u) => u !== username);
+  const headerTitle = viewMode === 'dm' ? currentDmUser : currentRoom ? currentRoom.name : 'Realtime Chat';
+  const isComposerReady = viewMode === 'dm' ? registered : registered && roomReady;
 
   return (
     <div className="chat-app">
@@ -146,8 +218,8 @@ function App() {
           {rooms.map((room) => (
             <li key={room.id}>
               <button
-                className={`room-item ${room.id === currentRoomId ? 'active' : ''}`}
-                onClick={() => setCurrentRoomId(room.id)}
+                className={`room-item ${viewMode === 'room' && room.id === currentRoomId ? 'active' : ''}`}
+                onClick={() => handleSelectRoom(room.id)}
               >
                 {room.name}
               </button>
@@ -163,11 +235,29 @@ function App() {
           />
           <button type="submit">+ Add</button>
         </form>
+
+        <h2 className="dm-section-title">Direct Messages</h2>
+        {otherOnlineUsers.length === 0 ? (
+          <p className="no-users-message">No one else online</p>
+        ) : (
+          <ul className="dm-list">
+            {otherOnlineUsers.map((u) => (
+              <li key={u}>
+                <button
+                  className={`dm-item ${viewMode === 'dm' && currentDmUser === u ? 'active' : ''}`}
+                  onClick={() => handleOpenDm(u)}
+                >
+                  {u}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </aside>
 
       <div className="chat-main">
         <header className="chat-header">
-          <h1>{currentRoom ? currentRoom.name : 'Realtime Chat'}</h1>
+          <h1>{headerTitle}</h1>
           <span className="current-user">Logged in as {username}</span>
         </header>
 
@@ -184,8 +274,8 @@ function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {roomReady ? (
-          <form className="message-form" onSubmit={handleSend}>
+        {isComposerReady ? (
+          <form className="message-form" onSubmit={viewMode === 'dm' ? handleSendDm : handleSend}>
             <input
               type="text"
               placeholder="Type a message..."
@@ -196,7 +286,9 @@ function App() {
             <button type="submit">Send</button>
           </form>
         ) : (
-          <div className="message-form message-form-loading">Joining room…</div>
+          <div className="message-form message-form-loading">
+            {viewMode === 'dm' ? 'Connecting…' : 'Joining room…'}
+          </div>
         )}
       </div>
     </div>
