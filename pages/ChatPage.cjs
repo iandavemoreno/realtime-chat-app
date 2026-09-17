@@ -100,6 +100,20 @@ class ChatPage {
     // The header updates to the other person's name once the switch lands
     await expect(this.page.locator('.chat-header h1')).toHaveText(username);
   }
+
+  // Fills the composer without sending — for asserting on the OTHER side's
+  // typing indicator without actually posting a message.
+  async typeIntoComposer(text) {
+    await this.page.locator('.message-form input').fill(text);
+  }
+
+  async clearComposer() {
+    await this.page.locator('.message-form input').fill('');
+  }
+
+  getTypingIndicator() {
+    return this.page.locator('.typing-indicator');
+  }
 }
 
 module.exports = ChatPage;

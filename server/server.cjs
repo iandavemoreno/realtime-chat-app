@@ -277,8 +277,37 @@ io.on('connection', (socket) => {
     socket.emit('new-dm', message);
   });
 
+  // "socket.to" (unlike "io.to") broadcasts to everyone else in the room
+  // except the sender — exactly what a typing indicator needs.
+  socket.on('typing', ({ roomId, isTyping }) => {
+    if (!roomId) return;
+    socket.to(roomChannel(roomId)).emit('user-typing', {
+      roomId,
+      username: socket.username,
+      isTyping: !!isTyping,
+    });
+  });
+
+  socket.on('typing-dm', ({ toUsername, isTyping }) => {
+    if (!toUsername) return;
+    const targetSocketId = onlineUsers.get(toUsername);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('user-typing-dm', {
+        fromUsername: socket.username,
+        isTyping: !!isTyping,
+      });
+    }
+  });
+
   socket.on('disconnect', () => {
     if (currentRoomId) {
+      // Let the room know immediately, rather than leaving a stale "is
+      // typing" indicator up until the client-side safety timeout expires.
+      socket.to(roomChannel(currentRoomId)).emit('user-typing', {
+        roomId: currentRoomId,
+        username: socket.username,
+        isTyping: false,
+      });
       socket.leave(roomChannel(currentRoomId));
     }
     if (onlineUsers.get(socket.username) === socket.id) {

@@ -30,8 +30,12 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState('');
 
+  const [typingUsers, setTypingUsers] = useState([]); // usernames typing in the current room
+  const [dmTypingUser, setDmTypingUser] = useState(false); // is currentDmUser typing to me
+
   const socketRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const typingStopTimerRef = useRef(null);
 
   // Kept in refs so the long-lived 'new-dm' listener (registered once) can
   // always see the latest view without needing to be torn down and
@@ -127,6 +131,9 @@ function App() {
     setViewMode('room');
     setCurrentDmUser(null);
     setMessages([]);
+    setTypingUsers([]);
+    setDmTypingUser(false);
+    clearTimeout(typingStopTimerRef.current);
     setAuthMode('signup');
     setAuthUsernameInput('');
     setAuthPasswordInput('');
@@ -200,6 +207,7 @@ function App() {
     const socket = socketRef.current;
 
     setRoomReady(false);
+    setTypingUsers([]);
     socket.emit('join-room', { roomId: currentRoomId }, () => {
       // Only now is this socket guaranteed to be registered server-side to
       // receive broadcasts for this room.
@@ -216,22 +224,64 @@ function App() {
         setMessages((prev) => [...prev, message]);
       }
     }
-
     socket.on('new-message', handleNewMessage);
+
+    // Per-user auto-clear timers: a safety net so a typing indicator can
+    // never get stuck forever if an explicit "stopped typing" event is
+    // ever lost (e.g. a flaky connection).
+    const typingTimers = {};
+    function handleUserTyping({ roomId: eventRoomId, username: typingUsername, isTyping }) {
+      if (eventRoomId !== currentRoomId) return;
+      setTypingUsers((prev) => {
+        if (isTyping) {
+          return prev.includes(typingUsername) ? prev : [...prev, typingUsername];
+        }
+        return prev.filter((u) => u !== typingUsername);
+      });
+      clearTimeout(typingTimers[typingUsername]);
+      if (isTyping) {
+        typingTimers[typingUsername] = setTimeout(() => {
+          setTypingUsers((prev) => prev.filter((u) => u !== typingUsername));
+        }, 3000);
+      }
+    }
+    socket.on('user-typing', handleUserTyping);
+
     return () => {
       socket.off('new-message', handleNewMessage);
+      socket.off('user-typing', handleUserTyping);
+      Object.values(typingTimers).forEach(clearTimeout);
     };
   }, [currentRoomId, viewMode, token]);
 
   // Whenever a DM conversation is opened, load its history.
   useEffect(() => {
-    if (viewMode !== 'dm' || !currentDmUser) return;
+    if (viewMode !== 'dm' || !currentDmUser || !socketRef.current) return;
+    const socket = socketRef.current;
+    setDmTypingUser(false);
+
     fetch(`${SOCKET_URL}/api/dms?user1=${encodeURIComponent(username)}&user2=${encodeURIComponent(currentDmUser)}`, {
       headers: authHeaders(),
     })
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error('Failed to load DM history'))))
       .then((dms) => setMessages(dms.map((m) => ({ id: m.id, username: m.from_username, text: m.text }))))
       .catch(() => {});
+
+    let dmTypingTimer = null;
+    function handleDmTyping({ fromUsername, isTyping }) {
+      if (fromUsername !== currentDmUser) return;
+      setDmTypingUser(isTyping);
+      clearTimeout(dmTypingTimer);
+      if (isTyping) {
+        dmTypingTimer = setTimeout(() => setDmTypingUser(false), 3000);
+      }
+    }
+    socket.on('user-typing-dm', handleDmTyping);
+
+    return () => {
+      socket.off('user-typing-dm', handleDmTyping);
+      clearTimeout(dmTypingTimer);
+    };
   }, [viewMode, currentDmUser, token]);
 
   useEffect(() => {
@@ -241,6 +291,8 @@ function App() {
   function handleSend(e) {
     e.preventDefault();
     if (!messageInput.trim() || !currentRoomId) return;
+    clearTimeout(typingStopTimerRef.current);
+    socketRef.current.emit('typing', { roomId: currentRoomId, isTyping: false });
     socketRef.current.emit('send-message', {
       roomId: currentRoomId,
       text: messageInput,
@@ -251,11 +303,36 @@ function App() {
   function handleSendDm(e) {
     e.preventDefault();
     if (!messageInput.trim() || !currentDmUser) return;
+    clearTimeout(typingStopTimerRef.current);
+    socketRef.current.emit('typing-dm', { toUsername: currentDmUser, isTyping: false });
     socketRef.current.emit('send-dm', {
       toUsername: currentDmUser,
       text: messageInput,
     });
     setMessageInput('');
+  }
+
+  // Tells the other side(s) "I'm typing", then automatically tells them
+  // "I stopped" after a short pause with no further keystrokes.
+  function handleMessageInputChange(e) {
+    const value = e.target.value;
+    setMessageInput(value);
+
+    const socket = socketRef.current;
+    if (!socket) return;
+
+    clearTimeout(typingStopTimerRef.current);
+    if (viewMode === 'room' && currentRoomId) {
+      socket.emit('typing', { roomId: currentRoomId, isTyping: true });
+      typingStopTimerRef.current = setTimeout(() => {
+        socket.emit('typing', { roomId: currentRoomId, isTyping: false });
+      }, 1500);
+    } else if (viewMode === 'dm' && currentDmUser) {
+      socket.emit('typing-dm', { toUsername: currentDmUser, isTyping: true });
+      typingStopTimerRef.current = setTimeout(() => {
+        socket.emit('typing-dm', { toUsername: currentDmUser, isTyping: false });
+      }, 1500);
+    }
   }
 
   async function handleCreateRoom(e) {
@@ -415,13 +492,22 @@ function App() {
           <div ref={messagesEndRef} />
         </div>
 
+        {viewMode === 'room' && typingUsers.length > 0 && (
+          <div className="typing-indicator">
+            {typingUsers.join(', ')} {typingUsers.length === 1 ? 'is' : 'are'} typing…
+          </div>
+        )}
+        {viewMode === 'dm' && dmTypingUser && (
+          <div className="typing-indicator">{currentDmUser} is typing…</div>
+        )}
+
         {isComposerReady ? (
           <form className="message-form" onSubmit={viewMode === 'dm' ? handleSendDm : handleSend}>
             <input
               type="text"
               placeholder="Type a message..."
               value={messageInput}
-              onChange={(e) => setMessageInput(e.target.value)}
+              onChange={handleMessageInputChange}
               autoFocus
             />
             <button type="submit">Send</button>
