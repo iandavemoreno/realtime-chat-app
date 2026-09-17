@@ -16,6 +16,24 @@ class ChatPage {
     await this.page.locator('.message-form input').waitFor({ state: 'visible' });
   }
 
+  getRoomItem(roomName) {
+    return this.page.locator('.room-item', { hasText: roomName });
+  }
+
+  async selectRoom(roomName) {
+    await this.getRoomItem(roomName).click();
+    // The header updates to the selected room's name once the switch lands
+    await expect(this.page.locator('.chat-header h1')).toHaveText(roomName);
+  }
+
+  async createRoom(roomName) {
+    await this.page.locator('.new-room-form input').fill(roomName);
+    await this.page.locator('.new-room-form button').click();
+    // Creating a room also switches into it
+    await expect(this.page.locator('.chat-header h1')).toHaveText(roomName);
+    await expect(this.getRoomItem(roomName)).toBeVisible();
+  }
+
   async sendMessage(text) {
     const input = this.page.locator('.message-form input');
     await input.fill(text);

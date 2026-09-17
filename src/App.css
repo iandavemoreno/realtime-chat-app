@@ -42,11 +42,92 @@
 
 .chat-app {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100vh;
-  max-width: 600px;
-  margin: 0 auto;
   background: #fff;
+}
+
+.room-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: #f7f7fb;
+  border-right: 1px solid #eee;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.room-sidebar h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  margin: 0 0 12px;
+}
+
+.room-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.room-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #333;
+}
+
+.room-item:hover {
+  background: #ececf5;
+}
+
+.room-item.active {
+  background: #4f46e5;
+  color: white;
+}
+
+.new-room-form {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.new-room-form input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.new-room-form button {
+  padding: 8px 10px;
+  background: #4f46e5;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .chat-header {
@@ -126,4 +207,10 @@
   border: none;
   border-radius: 20px;
   cursor: pointer;
+}
+
+.message-form-loading {
+  color: #999;
+  font-size: 14px;
+  font-style: italic;
 }

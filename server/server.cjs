@@ -11,24 +11,79 @@ app.use(express.json());
 
 const db = new Database(path.join(__dirname, 'chat.db'));
 db.exec(`
+  CREATE TABLE IF NOT EXISTS rooms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id INTEGER NOT NULL,
     username TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (room_id) REFERENCES rooms(id)
+  );
 `);
 
-// Fetch chat history
+// Seed two default rooms the first time the app ever runs
+const roomCount = db.prepare('SELECT COUNT(*) AS count FROM rooms').get().count;
+if (roomCount === 0) {
+  const insertRoom = db.prepare('INSERT INTO rooms (name) VALUES (?)');
+  insertRoom.run('General');
+  insertRoom.run('Random');
+}
+
+// ---- Rooms ----
+
+app.get('/api/rooms', (req, res) => {
+  const rooms = db.prepare('SELECT * FROM rooms ORDER BY id ASC').all();
+  res.json(rooms);
+});
+
+app.post('/api/rooms', (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (!name) {
+    return res.status(400).json({ error: 'Room name is required' });
+  }
+
+  const existing = db.prepare('SELECT * FROM rooms WHERE name = ?').get(name);
+  if (existing) {
+    return res.status(409).json({ error: 'A room with that name already exists' });
+  }
+
+  const result = db.prepare('INSERT INTO rooms (name) VALUES (?)').run(name);
+  const room = db.prepare('SELECT * FROM rooms WHERE id = ?').get(result.lastInsertRowid);
+
+  // Let every connected client know a new room exists, live
+  io.emit('room-created', room);
+
+  res.status(201).json(room);
+});
+
+// ---- Messages (scoped to a room) ----
+
 app.get('/api/messages', (req, res) => {
-  const messages = db.prepare('SELECT * FROM messages ORDER BY id ASC LIMIT 100').all();
+  const roomId = Number(req.query.roomId);
+  if (!roomId) {
+    return res.status(400).json({ error: 'roomId query param is required' });
+  }
+  const messages = db
+    .prepare('SELECT * FROM messages WHERE room_id = ? ORDER BY id ASC LIMIT 100')
+    .all(roomId);
   res.json(messages);
 });
 
-// Test-only helper: wipe all messages so the suite can start from a clean slate
-app.delete('/api/messages', (req, res) => {
-  db.prepare('DELETE FROM messages').run();
-  res.json({ ok: true });
+// Test-only helper: wipe all rooms/messages and reseed the two defaults, so
+// the Playwright suite can start every run from a known, clean state.
+app.post('/api/test-reset', (req, res) => {
+  db.exec('DELETE FROM messages; DELETE FROM rooms;');
+  const insertRoom = db.prepare('INSERT INTO rooms (name) VALUES (?)');
+  insertRoom.run('General');
+  insertRoom.run('Random');
+  const rooms = db.prepare('SELECT * FROM rooms ORDER BY id ASC').all();
+  res.json({ ok: true, rooms });
 });
 
 const server = http.createServer(app);
@@ -36,23 +91,42 @@ const io = new Server(server, {
   cors: { origin: '*' }
 });
 
+function roomChannel(roomId) {
+  return `room-${roomId}`;
+}
+
 io.on('connection', (socket) => {
-  console.log('a user connected:', socket.id);
+  let currentRoomId = null;
 
-  socket.on('send-message', ({ username, text }) => {
-    if (!username || !text || !text.trim()) return;
+  socket.on('join-room', ({ roomId }, callback) => {
+    if (currentRoomId) {
+      socket.leave(roomChannel(currentRoomId));
+    }
+    currentRoomId = roomId;
+    socket.join(roomChannel(roomId));
+    // Acknowledge back to the client once this socket is actually
+    // registered in the room's channel — the client waits for this before
+    // treating itself as "ready", closing a race where a message could be
+    // broadcast before a just-joined client is listening for it.
+    if (typeof callback === 'function') callback();
+  });
 
-    const stmt = db.prepare('INSERT INTO messages (username, text) VALUES (?, ?)');
-    const result = stmt.run(username, text.trim());
+  socket.on('send-message', ({ roomId, username, text }) => {
+    if (!roomId || !username || !text || !text.trim()) return;
+
+    const stmt = db.prepare('INSERT INTO messages (room_id, username, text) VALUES (?, ?, ?)');
+    const result = stmt.run(roomId, username, text.trim());
 
     const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(result.lastInsertRowid);
 
-    // Broadcast to everyone, including the sender
-    io.emit('new-message', message);
+    // Only broadcast to clients currently joined to this room
+    io.to(roomChannel(roomId)).emit('new-message', message);
   });
 
   socket.on('disconnect', () => {
-    console.log('a user disconnected:', socket.id);
+    if (currentRoomId) {
+      socket.leave(roomChannel(currentRoomId));
+    }
   });
 });
 
